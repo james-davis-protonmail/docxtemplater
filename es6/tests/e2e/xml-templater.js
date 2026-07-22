@@ -294,8 +294,10 @@ describe("Change the nullGetter", () => {
 	it("should work with null in resolve", () => {
 		const content = "<w:t>Hello {#names}{#foo}{bar}{/foo}{/names}</w:t>";
 		let calls = 0;
+		let mainSm = null;
 		function nullGetter(part, scopeManager) {
 			calls++;
+			mainSm = scopeManager;
 			expect(scopeManager.scopePath).to.deep.equal(["names", "foo"]);
 			expect(scopeManager.scopePathItem).to.deep.equal([0, 0]);
 			return "null";
@@ -310,7 +312,31 @@ describe("Change the nullGetter", () => {
 			.then(() => {
 				expect(calls).to.be.equal(1);
 				expect(xmlTemplater.getFullText()).to.be.equal("Hello null");
+				delete mainSm.root;
+				expect(mainSm).to.matchSnapshot();
 			});
+	});
+
+	it("should correctly calculate scopeTypes in scopemanager", () => {
+		const content = "<w:t>Hello {#names}{#cond}{bar}{/}{/}</w:t>";
+		let mainSm = null;
+		const xmlTemplater = createXmlTemplaterDocxNoRender(content, {
+			parser: (tag) => ({
+				get(scope, z) {
+					mainSm = z;
+					return scope[tag];
+				},
+			}),
+		});
+		xmlTemplater.render({
+			names: [{ foo: [{}] }],
+			cond: true,
+		});
+
+		delete mainSm.root;
+		// Verify presence of scopeTypes
+		expect(mainSm.scopeTypes).to.deep.equal(["array", true]);
+		expect(mainSm).to.matchSnapshot();
 	});
 });
 

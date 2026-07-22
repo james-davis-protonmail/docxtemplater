@@ -1,3 +1,33 @@
+## 3.69.1
+
+Correctly set scopeType to true when having a condition that evaluates to true.
+
+For example, with this template :
+
+```docx
+Hello {#names}{#cond}{bar}{/}{/}
+```
+
+With the following code :
+
+```js
+const doc = new Docxtemplater(zip, {
+    parser: (tag) => ({
+        get(scope, context) {
+            console.log(context.scopeTypes);
+            // This will log : ["array", true]
+            // Because for the names tag, the return value is an array, and for the
+            // cond tag, the return value is true.
+            return scope[tag];
+        },
+    }),
+});
+doc.render({
+    names: [{ foo: [{}] }],
+    cond: true,
+});
+```
+
 ## 3.69.0
 
 Enhance the library's security by implementing a defense-in-depth strategy, incorporating multiple layers of security to mitigate potential attacks.

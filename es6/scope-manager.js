@@ -196,6 +196,7 @@ const ScopeManager = class ScopeManager {
 			this.scopeType = "object";
 			return this.functorIfInverted(!inverted, functor, value, 0, 1);
 		}
+		this.scopeType = true;
 		return this.functorIfInverted(
 			!inverted,
 			functor,

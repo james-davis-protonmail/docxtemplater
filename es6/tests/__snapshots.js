@@ -80,6 +80,104 @@ exports[`Api versioning should fail with invalid versions-3`] = {
   }
 }
 
+exports[`Change the nullGetter should correctly calculate scopeTypes in scopemanager`] = {
+  "num": 0,
+  "meta": {
+    "part": {
+      "type": "placeholder",
+      "value": "bar",
+      "offset": 21,
+      "endLindex": 10,
+      "lIndex": 10
+    }
+  },
+  "scopeList": [
+    {
+      "names": [
+        {
+          "foo": [
+            {}
+          ]
+        }
+      ],
+      "cond": true
+    },
+    {
+      "foo": [
+        {}
+      ]
+    },
+    {
+      "foo": [
+        {}
+      ]
+    }
+  ],
+  "scopePath": [
+    "names",
+    "cond"
+  ],
+  "scopeTypes": [
+    "array",
+    true
+  ],
+  "scopePathItem": [
+    0,
+    0
+  ],
+  "scopePathLength": [
+    1,
+    1
+  ]
+}
+
+exports[`Change the nullGetter should work with null in resolve`] = {
+  "resolveOffset": 0,
+  "scopePath": [
+    "names",
+    "foo"
+  ],
+  "scopePathItem": [
+    0,
+    0
+  ],
+  "scopePathLength": [
+    1,
+    1
+  ],
+  "scopeList": [
+    {
+      "names": [
+        {
+          "foo": [
+            {}
+          ]
+        }
+      ]
+    },
+    {
+      "foo": [
+        {}
+      ]
+    },
+    {}
+  ],
+  "scopeType": "",
+  "scopeTypes": [
+    "array",
+    "array"
+  ],
+  "scopeLindex": [
+    4,
+    7
+  ],
+  "cachedParsers": {
+    "4": {},
+    "7": {},
+    "10": {}
+  }
+}
+
 exports[`Compilation errors should count 3 errors when having rawxml and two other errors`] = {
   "_type": "XTTemplateError",
   "name": "TemplateError",
