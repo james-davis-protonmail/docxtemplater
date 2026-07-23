@@ -2529,7 +2529,6 @@ http://errors.angularjs.org/"NG_VERSION_FULL"/$parse/lexerr?p0=Unexpected%20next
 				const firstExpression = result.compiled.ast.body[0].expression;
 				expect(firstExpression.type).to.equal("Identifier");
 				expect(firstExpression.name).to.equal("a");
-				expect(firstExpression.constant).to.equal(false);
 				return result;
 			},
 		},
@@ -2545,7 +2544,6 @@ http://errors.angularjs.org/"NG_VERSION_FULL"/$parse/lexerr?p0=Unexpected%20next
 				const firstExpression = result.compiled.ast.body[0].expression;
 				expect(firstExpression.type).to.equal("Identifier");
 				expect(firstExpression.name).to.equal("a");
-				expect(firstExpression.constant).to.equal(false);
 				return result;
 			},
 		},

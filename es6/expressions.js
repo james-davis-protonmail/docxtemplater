@@ -126,7 +126,7 @@ function getIdentifiers(x) {
 		}
 		return result;
 	}
-	if (x.type === "CallExpression") {
+	if (x.type === "CallExpression" || x.type === "FilterExpression") {
 		if (x.arguments) {
 			const result = [];
 			for (const arg of x.arguments) {
