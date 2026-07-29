@@ -7,11 +7,12 @@ function exactTag(expected) {
 }
 
 function caseTag(tag) {
-	const match = tag.match(/^!case(?:\s+([\s\S]*))?$/);
+	const match = tag.trim().match(/^!case(?:\s+([\s\S]*))?$/);
 	if (!match) {
 		return false;
 	}
-	return (match[1] || "").trim() || "__EMPTY_CONDITIONAL_SWITCH_CASE__";
+	const expression = (match[1] || "").trim();
+	return { expression, emptyCase: expression === "" };
 }
 
 function makeTemplateError(id, message, part, extra = {}) {
@@ -90,6 +91,18 @@ function markControlOnlyParagraphs(parsed) {
 			} else if (paragraphPart.type === "placeholder") {
 				hasVisibleContent = true;
 			} else if (
+				paragraphPart.type === "tag" &&
+				paragraphPart.position === "selfclosing" &&
+				[
+					"w:br",
+					"w:bookmarkStart",
+					"w:bookmarkEnd",
+					"w:commentRangeStart",
+					"w:commentRangeEnd",
+				].includes(paragraphPart.tag)
+			) {
+				hasVisibleContent = true;
+			} else if (
 				paragraphPart.type === "content" &&
 				paragraphPart.value &&
 				paragraphPart.value.trim() !== ""
@@ -122,12 +135,47 @@ function unique(values) {
 	return [...new Set(values.filter(Boolean))];
 }
 
+function isVisibleBranchPart(part) {
+	return (
+		part.type === "placeholder" ||
+		(part.type === "content" && part.position === "insidetag")
+	);
+}
+
+function takeTrailingTransition(parts) {
+	const lastPart = parts[parts.length - 1];
+	if (!lastPart || lastPart.type !== "tag" || lastPart.position !== "start") {
+		return [];
+	}
+	let index = parts.length - 1;
+	while (index >= 0 && !isVisibleBranchPart(parts[index])) {
+		index--;
+	}
+	return parts.splice(index + 1);
+}
+
+function findResolvedPart(scopeManager, part) {
+	let { resolved } = scopeManager;
+	for (
+		let index = scopeManager.resolveOffset;
+		index < scopeManager.scopePath.length;
+		index++
+	) {
+		const lIndex = scopeManager.scopeLindex[index];
+		const entry = resolved.find((item) => item.lIndex === lIndex);
+		if (!entry) {
+			return null;
+		}
+		resolved = entry.value[scopeManager.scopePathItem[index]];
+	}
+	return resolved.find((item) => item.lIndex === part.lIndex) || null;
+}
+
 class ConditionalSwitchModule {
 	constructor() {
 		this.name = "ConditionalSwitchModule";
+		this.priority = 100;
 		this.requiredAPIVersion = "3.47.2";
-		this.caseExpressions = new Map();
-		this.caseExpressionsByOffset = new Map();
 	}
 
 	clone() {
@@ -154,11 +202,10 @@ class ConditionalSwitchModule {
 			[
 				caseTag,
 				MODULE_NAME,
-				([, expression]) => ({
+				([, match]) => ({
 					switchKind: "case",
-					value: expression,
-					emptyCase:
-						expression === "__EMPTY_CONDITIONAL_SWITCH_CASE__",
+					value: match.expression || ".",
+					emptyCase: match.emptyCase,
 					dataBound: false,
 					priority: 100,
 				}),
@@ -186,9 +233,10 @@ class ConditionalSwitchModule {
 		];
 	}
 
-	getConditionIdentifiers(expression, part) {
+	compileCondition(expression, part, options, errors) {
 		try {
 			const parser = this.docxtemplater.parser(expression, { tag: part });
+			options.cachedParsers[part.lIndex] = parser;
 			const identifiers =
 				typeof parser.getIdentifiers === "function"
 					? parser.getIdentifiers()
@@ -198,11 +246,15 @@ class ConditionalSwitchModule {
 					? flattenObjectIdentifiers(parser.getObjectIdentifiers())
 					: [];
 			return unique([...identifiers, ...objectIdentifiers]);
-		} catch {
-			/*
-			 * The core Render module reports the parser compilation error. Keeping
-			 * discovery best-effort here avoids producing a duplicate error.
-			 */
+		} catch (rootError) {
+			errors.push(
+				makeTemplateError(
+					"conditional_switch_invalid_expression",
+					`Invalid conditional switch case expression "${expression}".`,
+					part,
+					{ expression, rootError, xtag: expression }
+				)
+			);
 			return [];
 		}
 	}
@@ -237,6 +289,10 @@ class ConditionalSwitchModule {
 			}
 
 			if (part.switchKind === "switch") {
+				if (part.branches) {
+					output.push(part);
+					continue;
+				}
 				const grouped = this.groupSwitch(
 					parsed,
 					index,
@@ -281,6 +337,7 @@ class ConditionalSwitchModule {
 		let depth = 0;
 		let endIndex = parsed.length - 1;
 		let foundEnd = false;
+		let pendingContent = [];
 
 		for (let index = startIndex + 1; index < parsed.length; index++) {
 			const part = parsed[index];
@@ -288,6 +345,8 @@ class ConditionalSwitchModule {
 				depth++;
 				if (currentBranch) {
 					currentBranch.rawContent.push(part);
+				} else if (!part.switchControlScaffold) {
+					pendingContent.push(part);
 				}
 				continue;
 			}
@@ -296,6 +355,8 @@ class ConditionalSwitchModule {
 					depth--;
 					if (currentBranch) {
 						currentBranch.rawContent.push(part);
+					} else if (!part.switchControlScaffold) {
+						pendingContent.push(part);
 					}
 					continue;
 				}
@@ -304,12 +365,21 @@ class ConditionalSwitchModule {
 				break;
 			}
 
+			if (depth > 0) {
+				if (currentBranch) {
+					if (isControl(part) || !part.switchControlScaffold) {
+						currentBranch.rawContent.push(part);
+					}
+				} else if (isControl(part) || !part.switchControlScaffold) {
+					pendingContent.push(part);
+				}
+				continue;
+			}
+
 			if (depth === 0 && isControl(part, "case")) {
 				if (part.emptyCase) {
 					part.value = "";
 				}
-				this.caseExpressions.set(part.lIndex, part.value);
-				this.caseExpressionsByOffset.set(part.offset, part.value);
 				if (!part.value) {
 					errors.push(
 						makeTemplateError(
@@ -330,11 +400,15 @@ class ConditionalSwitchModule {
 						)
 					);
 				}
+				const leadingContent = currentBranch
+					? takeTrailingTransition(currentBranch.rawContent)
+					: pendingContent;
+				pendingContent = [];
 				currentBranch = {
 					kind: "case",
 					expression: part.value,
 					controlPart: part,
-					rawContent: [],
+					rawContent: leadingContent,
 				};
 				branches.push(currentBranch);
 				continue;
@@ -351,11 +425,15 @@ class ConditionalSwitchModule {
 					);
 				}
 				defaultSeen = true;
+				const leadingContent = currentBranch
+					? takeTrailingTransition(currentBranch.rawContent)
+					: pendingContent;
+				pendingContent = [];
 				currentBranch = {
 					kind: "default",
 					expression: null,
 					controlPart: part,
-					rawContent: [],
+					rawContent: leadingContent,
 				};
 				branches.push(currentBranch);
 				continue;
@@ -363,6 +441,8 @@ class ConditionalSwitchModule {
 
 			if (currentBranch && !part.switchControlScaffold) {
 				currentBranch.rawContent.push(part);
+			} else if (!currentBranch && !part.switchControlScaffold) {
+				pendingContent.push(part);
 			}
 		}
 
@@ -396,9 +476,11 @@ class ConditionalSwitchModule {
 			delete branch.rawContent;
 			const identifiers =
 				branch.kind === "case"
-					? this.getConditionIdentifiers(
+					? this.compileCondition(
 							branch.expression,
-							branch.controlPart
+							branch.controlPart,
+							options,
+							errors
 						)
 					: [];
 			branch.identifiers = identifiers;
@@ -426,39 +508,6 @@ class ConditionalSwitchModule {
 			endLindex: foundEnd ? parsed[endIndex].lIndex : switchPart.lIndex,
 		};
 		return { part: groupedPart, endIndex };
-	}
-
-	errorsTransformer(errors) {
-		for (const error of errors) {
-			const lIndex = error && error.properties && error.properties.lIndex;
-			const offset = error && error.properties && error.properties.offset;
-			const expression =
-				this.caseExpressions.get(lIndex) ||
-				this.caseExpressionsByOffset.get(offset);
-			if (
-				error &&
-				error.properties &&
-				error.properties.id === "scopeparser_compilation_failed" &&
-				expression != null
-			) {
-				error.properties.id = "conditional_switch_invalid_expression";
-				error.properties.expression = expression;
-				error.properties.xtag = expression;
-				error.properties.explanation = `Invalid conditional switch case expression "${expression}": ${error.properties.explanation}`;
-			}
-		}
-		return errors;
-	}
-
-	createBranchScope(scopeManager, part) {
-		const scope = scopeManager.scopeList[scopeManager.scopeList.length - 1];
-		return scopeManager.createSubScopeManager(
-			scope,
-			part.value,
-			0,
-			part,
-			1
-		);
 	}
 
 	resolve(part, options) {
@@ -508,17 +557,21 @@ class ConditionalSwitchModule {
 		return [[...conditionResults, ...resolved]];
 	}
 
-	getSelectedBranch(part, scopeManager, branchScope) {
+	getSelectedBranch(part, scopeManager, resolvedEntries) {
 		for (const branch of part.branches) {
 			if (branch.kind === "default") {
 				return branch;
 			}
-			const manager = scopeManager.root.finishedResolving
-				? branchScope
-				: scopeManager;
-			const value = manager.getValue(branch.expression, {
-				part: branch.controlPart,
-			});
+			const resolved = resolvedEntries
+				? resolvedEntries.find(
+						(item) => item.lIndex === branch.controlPart.lIndex
+					)
+				: null;
+			const value = resolvedEntries
+				? resolved && resolved.value
+				: scopeManager.getValue(branch.expression, {
+						part: branch.controlPart,
+					});
 			if (value) {
 				return branch;
 			}
@@ -530,16 +583,30 @@ class ConditionalSwitchModule {
 		if (!isControl(part, "switch") || !part.branches) {
 			return null;
 		}
-		const branchScope = this.createBranchScope(options.scopeManager, part);
+		const finishedResolving =
+			options.scopeManager.root.finishedResolving === true;
+		const switchResolution = finishedResolving
+			? findResolvedPart(options.scopeManager, part)
+			: null;
+		const resolvedEntries =
+			switchResolution && switchResolution.value
+				? switchResolution.value[0]
+				: null;
 		const selected = this.getSelectedBranch(
 			part,
 			options.scopeManager,
-			branchScope
+			resolvedEntries
 		);
 		if (!selected) {
 			return { value: "" };
 		}
 
+		let branchScope = options.scopeManager;
+		if (resolvedEntries) {
+			branchScope = Object.create(options.scopeManager);
+			branchScope.resolved = resolvedEntries;
+			branchScope.resolveOffset = branchScope.scopePath.length;
+		}
 		const subRendered = options.render({
 			...options,
 			compiled: selected.content,
