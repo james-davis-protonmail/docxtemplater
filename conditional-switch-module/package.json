@@ -1,0 +1,12 @@
+{
+  "name": "@private/docxtemplater-conditional-switch",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "docxtemplater": "3.69.3"
+  }
+}
