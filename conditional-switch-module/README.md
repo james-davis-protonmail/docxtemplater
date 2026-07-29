@@ -8,6 +8,7 @@ Private Docxtemplater module implementing ordered `switch` / `case` /
 - Standalone Node integration: `docxtemplater@3.69.3`
 - Docxtemplater Docker image: `3.46.5` (bundles Docxtemplater `3.69.0`)
 - Node.js: active LTS releases from 18 through 24
+- File formats: DOCX and PPTX
 
 These versions are deliberately pinned. Upgrade the module and rerun its test
 suite before changing either Docxtemplater or the Docker image.
@@ -90,8 +91,13 @@ inline, across paragraphs, in table cells, headers, footers, and loop-local
 scopes.
 
 Control-only paragraphs are removed. Inline control tags are removed without
-expanding to paragraph boundaries, preserving surrounding text and the Word
-runs of the selected branch.
+expanding to paragraph boundaries, preserving surrounding text and physical
+run/paragraph formatting in Word and PowerPoint.
+
+All controls in one switch must remain in the same table cell, hyperlink, and
+other structural content container. Layouts that cannot render every branch as
+balanced document XML fail compilation with
+`conditional_switch_invalid_structure`.
 
 ## Validation errors
 
@@ -105,6 +111,7 @@ Compilation reports module-specific error IDs for:
 - `conditional_switch_multiple_defaults`
 - `conditional_switch_case_after_default`
 - `conditional_switch_invalid_expression`
+- `conditional_switch_invalid_structure`
 
 Errors include the raw tag or expression, offset/lIndex where available, and
 the document part added by Docxtemplater (for example
@@ -134,5 +141,5 @@ npm run test:switch
 
 The suite covers synchronous and asynchronous rendering, ordered selection,
 Angular expressions and filters, missing values, loops, nesting, inline and
-multiline layout, tables, headers, footers, split Word runs, formatting,
-inspection, and all structural validation rules.
+multiline Word/PowerPoint layout, tables, headers, footers, split runs,
+formatting, inspection, and all structural validation rules.

@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
 const { DOMParser } = require("@xmldom/xmldom");
 const { expect } = require("chai");
 const PizZip = require("pizzip");
@@ -79,6 +81,34 @@ function createDoc(template, options = {}) {
 	});
 }
 
+function createPptxDoc(templateParagraphs, replacementFactory) {
+	const zip = new PizZip(
+		fs.readFileSync(
+			path.resolve(__dirname, "../examples/simple-example.pptx")
+		)
+	);
+	const slidePath = "ppt/slides/slide1.xml";
+	const slideXml = zip.file(slidePath).asText();
+	const paragraphMatch = slideXml.match(/<a:p>[\s\S]*?<\/a:p>/);
+	if (!paragraphMatch) {
+		throw new Error("PowerPoint fixture has no paragraph");
+	}
+	const paragraphTemplate = paragraphMatch[0];
+	const replacement = replacementFactory
+		? replacementFactory(paragraphTemplate)
+		: templateParagraphs
+				.map((value) =>
+					paragraphTemplate.replace("Hello {name}", escapeXml(value))
+				)
+				.join("");
+	zip.file(slidePath, slideXml.replace(paragraphTemplate, replacement));
+	return new Docxtemplater(zip, {
+		parser: expressionParser,
+		errorLogging: false,
+		modules: [new ConditionalSwitchModule()],
+	});
+}
+
 function xmlText(xml) {
 	return xml
 		.replace(/<[^>]+>/g, "")
@@ -113,9 +143,21 @@ function expectWellFormedXml(xml) {
 	).to.not.throw();
 }
 
+function directElementChildNames(xml, parentTag) {
+	const document = new DOMParser().parseFromString(xml, "text/xml");
+	const parent = document.getElementsByTagName(parentTag)[0];
+	const names = [];
+	for (let child = parent.firstChild; child; child = child.nextSibling) {
+		if (child.nodeType === 1) {
+			names.push(child.nodeName);
+		}
+	}
+	return names;
+}
+
 function runContaining(xml, text) {
-	return (xml.match(/<w:r(?:\s[^>]*)?>[\s\S]*?<\/w:r>/g) || []).find((run) =>
-		xmlText(run).includes(text)
+	return (xml.match(/<([wa]):r(?:\s[^>]*)?>[\s\S]*?<\/\1:r>/g) || []).find(
+		(run) => xmlText(run).includes(text)
 	);
 }
 
@@ -194,6 +236,276 @@ describe("private conditional switch module", () => {
 		expect((xml.match(/<w:p>/g) || []).length).to.equal(3);
 	});
 
+	it("removes styled control-only paragraphs", () => {
+		function styledControl(value) {
+			return `<w:p><w:pPr><w:keepNext/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>${escapeXml(
+				value
+			)}</w:t></w:r></w:p>`;
+		}
+		const template = [
+			styledControl("{!switch}"),
+			styledControl("{!case enabled}"),
+			paragraph("YES"),
+			styledControl("{!default}"),
+			paragraph("NO"),
+			styledControl("{/!switch}"),
+		].join("");
+
+		for (const [enabled, expected] of [
+			[true, "YES"],
+			[false, "NO"],
+		]) {
+			const doc = createDoc(template);
+			doc.render({ enabled });
+			const xml = renderedPart(doc);
+			expect(xmlText(xml)).to.equal(expected);
+			expect((xml.match(/<w:p>/g) || []).length).to.equal(1);
+			expect(xml).to.not.include("<w:pPr>");
+			expect(xml).to.not.include("<w:b/>");
+			expectWellFormedXml(xml);
+		}
+	});
+
+	it("removes proofing and cached-layout metadata with control paragraphs", () => {
+		function metadataControl(value) {
+			return (
+				'<w:p><w:proofErr w:type="spellStart"/>' +
+				`<w:r><w:t>${escapeXml(
+					value
+				)}</w:t><w:lastRenderedPageBreak/></w:r>` +
+				'<w:proofErr w:type="spellEnd"/></w:p>'
+			);
+		}
+		const template = [
+			metadataControl("{!switch}"),
+			metadataControl("{!case enabled}"),
+			paragraph("YES"),
+			metadataControl("{!default}"),
+			paragraph("NO"),
+			metadataControl("{/!switch}"),
+		].join("");
+
+		for (const [enabled, expected] of [
+			[true, "YES"],
+			[false, "NO"],
+		]) {
+			const doc = createDoc(template);
+			doc.render({ enabled });
+			const xml = renderedPart(doc);
+			expect(xmlText(xml)).to.equal(expected);
+			expect((xml.match(/<w:p>/g) || []).length).to.equal(1);
+			expect(xml).to.not.include("<w:proofErr");
+			expect(xml).to.not.include("<w:lastRenderedPageBreak");
+			expectWellFormedXml(xml);
+		}
+	});
+
+	it("does not confuse paragraph tab-stop formatting with a tab character", () => {
+		function tabStyledControl(value) {
+			return (
+				'<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr>' +
+				`<w:r><w:t>${escapeXml(value)}</w:t></w:r></w:p>`
+			);
+		}
+		const template = [
+			tabStyledControl("{!switch}"),
+			tabStyledControl("{!case enabled}"),
+			paragraph("YES"),
+			tabStyledControl("{!default}"),
+			paragraph("NO"),
+			tabStyledControl("{/!switch}"),
+		].join("");
+		const doc = createDoc(template);
+		doc.render({ enabled: true });
+		const xml = renderedPart(doc);
+		expect(xmlText(xml)).to.equal("YES");
+		expect((xml.match(/<w:p>/g) || []).length).to.equal(1);
+		expect(xml).to.not.include("<w:tabs");
+		expectWellFormedXml(xml);
+	});
+
+	it("supports styled multiline switches in PowerPoint", () => {
+		const templateParagraphs = [
+			"{!switch}",
+			"{!case enabled}",
+			"YES",
+			"{!default}",
+			"NO",
+			"{/!switch}",
+		];
+
+		for (const [enabled, expected] of [
+			[true, "YES"],
+			[false, "NO"],
+		]) {
+			const doc = createPptxDoc(templateParagraphs);
+			expect(doc.fileType).to.equal("pptx");
+			doc.render({ enabled });
+			const xml = renderedPart(doc, "ppt/slides/slide1.xml");
+			expect(doc.getFullText()).to.equal(expected);
+			expect((xml.match(/<a:p(?:\s[^>]*)?>/g) || []).length).to.equal(1);
+			expect((xml.match(/<a:pPr(?:\s[^>]*)?>/g) || []).length).to.equal(
+				1
+			);
+			expect(
+				(xml.match(/<a:endParaRPr(?:\s[^>]*)?>/g) || []).length
+			).to.equal(1);
+			expectWellFormedXml(xml);
+		}
+	});
+
+	it("keeps a styled PowerPoint break in its original branch", () => {
+		const paragraphXml =
+			'<a:p><a:pPr algn="ctr"/>' +
+			'<a:r><a:rPr lang="en-US"/><a:t>{!switch}{!case first}A</a:t></a:r>' +
+			'<a:br><a:rPr lang="fr-FR" sz="3200"/></a:br>' +
+			'<a:r><a:rPr b="1" lang="en-US"/><a:t>{!case second}B{/!switch}</a:t></a:r>' +
+			'<a:endParaRPr lang="en-US"/></a:p>';
+
+		const firstDoc = createPptxDoc([], () => paragraphXml);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc, "ppt/slides/slide1.xml");
+		expect(firstDoc.getFullText()).to.equal("A");
+		expect(firstXml).to.include(
+			'<a:br><a:rPr lang="fr-FR" sz="3200"/></a:br>'
+		);
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createPptxDoc([], () => paragraphXml);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc, "ppt/slides/slide1.xml");
+		expect(secondDoc.getFullText()).to.equal("B");
+		expect(secondXml).to.not.include("<a:br");
+		expect(secondXml).to.not.include('lang="fr-FR"');
+		expect(runContaining(secondXml, "B")).to.include('b="1"');
+		expectWellFormedXml(secondXml);
+	});
+
+	it("keeps a complete PowerPoint field in its original branch", () => {
+		const paragraphXml =
+			"<a:p><a:pPr/>" +
+			"<a:r><a:t>{!switch}{!case first}A</a:t></a:r>" +
+			'<a:fld id="{00000000-0000-0000-0000-000000000001}" type="datetime"><a:rPr lang="en-US"/><a:t>FIELD</a:t></a:fld>' +
+			'<a:r><a:rPr i="1"/><a:t>{!case second}B{/!switch}</a:t></a:r>' +
+			"<a:endParaRPr/></a:p>";
+
+		const firstDoc = createPptxDoc([], () => paragraphXml);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc, "ppt/slides/slide1.xml");
+		expect(firstDoc.getFullText()).to.equal("AFIELD");
+		expect(firstXml).to.include("<a:fld ");
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createPptxDoc([], () => paragraphXml);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc, "ppt/slides/slide1.xml");
+		expect(secondDoc.getFullText()).to.equal("B");
+		expect(secondXml).to.not.include("<a:fld ");
+		expect(runContaining(secondXml, "B")).to.include('i="1"');
+		expectWellFormedXml(secondXml);
+	});
+
+	it("keeps a semantic later-case PowerPoint paragraph with that branch", () => {
+		function makeTemplate(paragraphTemplate) {
+			function controlParagraph(value) {
+				return paragraphTemplate.replace(
+					"Hello {name}",
+					escapeXml(value)
+				);
+			}
+			const laterCase = controlParagraph("{!case second}").replace(
+				"</a:r><a:endParaRPr",
+				'</a:r><a:br><a:rPr lang="fr-FR" sz="3200"/></a:br><a:endParaRPr'
+			);
+			return [
+				controlParagraph("{!switch}"),
+				controlParagraph("{!case first}"),
+				controlParagraph("A"),
+				laterCase,
+				controlParagraph("B"),
+				controlParagraph("{/!switch}"),
+			].join("");
+		}
+
+		const firstDoc = createPptxDoc([], makeTemplate);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc, "ppt/slides/slide1.xml");
+		expect(firstDoc.getFullText()).to.equal("A");
+		expect(firstXml).to.not.include("<a:br");
+		expect((firstXml.match(/<a:p(?:\s[^>]*)?>/g) || []).length).to.equal(1);
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createPptxDoc([], makeTemplate);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc, "ppt/slides/slide1.xml");
+		expect(secondDoc.getFullText()).to.equal("B");
+		expect(secondXml).to.include(
+			'<a:br><a:rPr lang="fr-FR" sz="3200"/></a:br>'
+		);
+		expect((secondXml.match(/<a:p(?:\s[^>]*)?>/g) || []).length).to.equal(
+			2
+		);
+		expect(
+			directElementChildNames(secondXml, "p:txBody").every((name) =>
+				["a:bodyPr", "a:lstStyle", "a:p"].includes(name)
+			)
+		).to.equal(true);
+		expectWellFormedXml(secondXml);
+	});
+
+	it("does not leak a prior PowerPoint paragraph into a later branch", () => {
+		function makeTemplate(paragraphTemplate) {
+			function controlParagraph(value) {
+				return paragraphTemplate.replace(
+					"Hello {name}",
+					escapeXml(value)
+				);
+			}
+			const priorBreak = controlParagraph("").replace(
+				"</a:r><a:endParaRPr",
+				'</a:r><a:br><a:rPr lang="de-DE" sz="2800"/></a:br><a:endParaRPr'
+			);
+			const laterCase = controlParagraph("{!case second}").replace(
+				"</a:r><a:endParaRPr",
+				'</a:r><a:br><a:rPr lang="fr-FR" sz="3200"/></a:br><a:endParaRPr'
+			);
+			return [
+				controlParagraph("{!switch}"),
+				controlParagraph("{!case first}"),
+				controlParagraph("A"),
+				priorBreak,
+				laterCase,
+				controlParagraph("B"),
+				controlParagraph("{/!switch}"),
+			].join("");
+		}
+
+		const firstDoc = createPptxDoc([], makeTemplate);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc, "ppt/slides/slide1.xml");
+		expect(firstDoc.getFullText()).to.equal("A");
+		expect(firstXml).to.include('lang="de-DE"');
+		expect(firstXml).to.not.include('lang="fr-FR"');
+		expect((firstXml.match(/<a:p(?:\s[^>]*)?>/g) || []).length).to.equal(2);
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createPptxDoc([], makeTemplate);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc, "ppt/slides/slide1.xml");
+		expect(secondDoc.getFullText()).to.equal("B");
+		expect(secondXml).to.not.include('lang="de-DE"');
+		expect(secondXml).to.include('lang="fr-FR"');
+		expect((secondXml.match(/<a:p(?:\s[^>]*)?>/g) || []).length).to.equal(
+			2
+		);
+		expect(
+			directElementChildNames(secondXml, "p:txBody").every((name) =>
+				["a:bodyPr", "a:lstStyle", "a:p"].includes(name)
+			)
+		).to.equal(true);
+		expectWellFormedXml(secondXml);
+	});
+
 	it("supports comparisons, booleans, object access, negation, and missing values", () => {
 		const template = paragraph(
 			"{!switch}{!case customer.active && amount >= 1000 && !cancelled}approved{!case missing.value}missing{!default}other{/!switch}"
@@ -270,6 +582,79 @@ describe("private conditional switch module", () => {
 		expect((xml.match(/<w:p>/g) || []).length).to.equal(1);
 	});
 
+	it("removes control paragraphs nested inside a Word text box", () => {
+		const textBoxContent = [
+			paragraph("{!switch}"),
+			paragraph("{!case enabled}"),
+			paragraph("YES"),
+			paragraph("{!default}"),
+			paragraph("NO"),
+			paragraph("{/!switch}"),
+		].join("");
+		const template =
+			"<w:p><w:r><w:drawing><w:txbxContent>" +
+			textBoxContent +
+			"</w:txbxContent></w:drawing></w:r></w:p>";
+
+		for (const [enabled, expected] of [
+			[true, "YES"],
+			[false, "NO"],
+		]) {
+			const doc = createDoc(template);
+			doc.render({ enabled });
+			const xml = renderedPart(doc);
+			expect(xmlText(xml)).to.equal(expected);
+			expect((xml.match(/<w:p>/g) || []).length).to.equal(2);
+			expect((xml.match(/<w:drawing>/g) || []).length).to.equal(1);
+			expectWellFormedXml(xml);
+		}
+	});
+
+	it("supports structurally balanced mixed inline and multiline branches", () => {
+		const template = [
+			paragraph("{!switch}"),
+			paragraph("{!case first}FIRST"),
+			paragraph("{!case second}"),
+			paragraph("SECOND"),
+			paragraph("{/!switch}"),
+		].join("");
+
+		for (const [data, expected] of [
+			[{ first: true, second: true }, "FIRST"],
+			[{ first: false, second: true }, "SECOND"],
+		]) {
+			const doc = createDoc(template);
+			doc.render(data);
+			const xml = renderedPart(doc);
+			expect(xmlText(xml)).to.equal(expected);
+			expect((xml.match(/<w:p>/g) || []).length).to.equal(1);
+			expectWellFormedXml(xml);
+		}
+	});
+
+	it("rejects mixed layouts that cannot produce balanced XML", () => {
+		const template = [
+			paragraph("{!switch}"),
+			paragraph("{!case enabled}YES{!default}NO{/!switch}"),
+			paragraph("After"),
+		].join("");
+		let thrown;
+		try {
+			createDoc(template);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).to.not.equal(undefined);
+		const invalid = getErrors(thrown).find(
+			(error) =>
+				error.properties.id === "conditional_switch_invalid_structure"
+		);
+		expect(invalid).to.not.equal(undefined);
+		expect(invalid.name).to.equal("TemplateError");
+		expect(invalid.properties.xtag).to.equal("!switch");
+		expect(invalid.properties.file).to.equal("word/document.xml");
+	});
+
 	it("supports renderAsync", async () => {
 		const doc = createDoc(
 			paragraph(
@@ -340,28 +725,64 @@ describe("private conditional switch module", () => {
 		expect(renderText(body, { enabled: true })).to.equal("selected");
 	});
 
-	it("rejects cross-container branches or renders well-formed XML", () => {
+	it("allows a switch contained by one hyperlink", () => {
 		const body =
-			"<w:p><w:r><w:t>{!switch}{!case enabled}YES</w:t></w:r>" +
-			'<w:hyperlink w:anchor="target"><w:r><w:t>{!default}NO</w:t></w:r></w:hyperlink>' +
-			"<w:r><w:t>{/!switch}</w:t></w:r></w:p>";
-		let doc;
-		try {
-			doc = createDoc(body);
-			doc.render({ enabled: false });
-		} catch (error) {
-			expect(
-				getErrors(error).some(
-					(item) =>
-						item.properties.id ===
-						"conditional_switch_invalid_structure"
-				)
-			).to.equal(true);
-			return;
+			'<w:p><w:hyperlink w:anchor="target"><w:r><w:t>{!switch}{!case enabled}YES{!default}NO{/!switch}</w:t></w:r></w:hyperlink></w:p>';
+		for (const [enabled, expected] of [
+			[true, "YES"],
+			[false, "NO"],
+		]) {
+			const doc = createDoc(body);
+			doc.render({ enabled });
+			const xml = renderedPart(doc);
+			expect(xmlText(xml)).to.equal(expected);
+			expect(xml).to.include('<w:hyperlink w:anchor="target">');
+			expectWellFormedXml(xml);
 		}
-		const xml = renderedPart(doc);
-		expect(xmlText(xml)).to.equal("NO");
-		expectWellFormedXml(xml);
+	});
+
+	it("rejects switches that cross hyperlink containers", () => {
+		const body =
+			'<w:p><w:hyperlink w:anchor="target"><w:r><w:t>{!switch}{!case enabled}YES</w:t></w:r></w:hyperlink>' +
+			"<w:r><w:t>{!default}NO{/!switch}</w:t></w:r></w:p>";
+		let thrown;
+		try {
+			createDoc(body);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).to.not.equal(undefined);
+		const invalid = getErrors(thrown).find(
+			(error) =>
+				error.properties.id === "conditional_switch_invalid_structure"
+		);
+		expect(invalid).to.not.equal(undefined);
+		expect(invalid.properties.xtag).to.equal("!switch");
+		expect(invalid.properties.file).to.equal("word/document.xml");
+	});
+
+	it("rejects switches that cross table cells", () => {
+		const body =
+			`<w:tbl><w:tr><w:tc>${paragraph(
+				"{!switch}{!case enabled}YES"
+			)}</w:tc>` +
+			`<w:tc>${paragraph(
+				"{!default}NO{/!switch}"
+			)}</w:tc></w:tr></w:tbl>`;
+		let thrown;
+		try {
+			createDoc(body);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).to.not.equal(undefined);
+		expect(
+			getErrors(thrown).some(
+				(error) =>
+					error.properties.id ===
+					"conditional_switch_invalid_structure"
+			)
+		).to.equal(true);
 	});
 
 	it("preserves selected branch run formatting", () => {
@@ -390,6 +811,82 @@ describe("private conditional switch module", () => {
 		expect(selectedRun).to.not.include("<w:b/>");
 	});
 
+	it("restores the physical post-switch Word run", () => {
+		const body =
+			'<w:p><w:r><w:rPr><w:color w:val="FF0000"/></w:rPr>' +
+			"<w:t>PRE{!switch}{!case first}A</w:t></w:r>" +
+			"<w:r><w:rPr><w:b/></w:rPr><w:t>{!case second}B</w:t></w:r>" +
+			"<w:r><w:rPr><w:i/></w:rPr><w:t>{/!switch}POST</w:t></w:r></w:p>";
+
+		for (const [data, expected, expectedRuns] of [
+			[{ first: true, second: false }, "PREAPOST", 2],
+			[{ first: false, second: true }, "PREBPOST", 3],
+			[{ first: false, second: false }, "PREPOST", 2],
+		]) {
+			const doc = createDoc(body);
+			doc.render(data);
+			const xml = renderedPart(doc);
+			expect(xmlText(xml)).to.equal(expected);
+			expect((xml.match(/<w:r>/g) || []).length).to.equal(expectedRuns);
+			expect(runContaining(xml, "PRE")).to.include(
+				'<w:color w:val="FF0000"/>'
+			);
+			expect(runContaining(xml, "POST")).to.include("<w:i/>");
+			expectWellFormedXml(xml);
+		}
+	});
+
+	it("restores the physical post-switch Word paragraph", () => {
+		const body =
+			'<w:p><w:pPr><w:pStyle w:val="One"/></w:pPr>' +
+			"<w:r><w:t>PRE{!switch}{!case first}A</w:t></w:r></w:p>" +
+			'<w:p><w:pPr><w:pStyle w:val="Two"/></w:pPr>' +
+			"<w:r><w:t>{!case second}B{/!switch}POST</w:t></w:r></w:p>";
+
+		for (const [data, expected] of [
+			[{ first: true, second: false }, "PREAPOST"],
+			[{ first: false, second: true }, "PREBPOST"],
+			[{ first: false, second: false }, "PREPOST"],
+		]) {
+			const doc = createDoc(body);
+			doc.render(data);
+			const xml = renderedPart(doc);
+			const paragraphs = xml.match(/<w:p>[\s\S]*?<\/w:p>/g) || [];
+			expect(xmlText(xml)).to.equal(expected);
+			expect(paragraphs).to.have.length(2);
+			expect(paragraphs[0]).to.include('<w:pStyle w:val="One"/>');
+			expect(paragraphs[1]).to.include('<w:pStyle w:val="Two"/>');
+			expect(xmlText(paragraphs[1])).to.include("POST");
+			expectWellFormedXml(xml);
+		}
+	});
+
+	it("restores the physical post-switch PowerPoint run", () => {
+		const paragraphXml =
+			"<a:p><a:pPr/>" +
+			'<a:r><a:rPr i="1"/><a:t>PRE{!switch}{!case first}A</a:t></a:r>' +
+			'<a:r><a:rPr b="1"/><a:t>{!case second}B</a:t></a:r>' +
+			'<a:r><a:rPr u="sng"/><a:t>{/!switch}POST</a:t></a:r>' +
+			"<a:endParaRPr/></a:p>";
+
+		for (const [data, expected, expectedRuns] of [
+			[{ first: true, second: false }, "PREAPOST", 2],
+			[{ first: false, second: true }, "PREBPOST", 3],
+			[{ first: false, second: false }, "PREPOST", 2],
+		]) {
+			const doc = createPptxDoc([], () => paragraphXml);
+			doc.render(data);
+			const xml = renderedPart(doc, "ppt/slides/slide1.xml");
+			expect(doc.getFullText()).to.equal(expected);
+			expect((xml.match(/<a:r(?:\s[^>]*)?>/g) || []).length).to.equal(
+				expectedRuns
+			);
+			expect(runContaining(xml, "PRE")).to.include('i="1"');
+			expect(runContaining(xml, "POST")).to.include('u="sng"');
+			expectWellFormedXml(xml);
+		}
+	});
+
 	it("preserves a page break in a selected control paragraph", () => {
 		const body = [
 			paragraph("{!switch}"),
@@ -403,6 +900,333 @@ describe("private conditional switch module", () => {
 		const xml = renderedPart(doc);
 		expect(xml).to.include('<w:br w:type="page"/>');
 		expectWellFormedXml(xml);
+	});
+
+	it("preserves generated Word run content in a selected branch", () => {
+		const generatedContent =
+			"<w:p><w:r><w:t>{!case enabled}</w:t>" +
+			"<w:pgNum/><w:footnoteRef/><w:endnoteRef/><w:dayShort/>" +
+			'<w:instrText>DATE</w:instrText><w:contentPart r:id="rIdContent"/>' +
+			'</w:r><w:subDoc r:id="rIdSubDoc"/></w:p>';
+		const body = [
+			paragraph("{!switch}"),
+			generatedContent,
+			paragraph("Selected"),
+			paragraph("{!default}"),
+			paragraph("Other"),
+			paragraph("{/!switch}"),
+		].join("");
+
+		const selectedDoc = createDoc(body);
+		selectedDoc.render({ enabled: true });
+		const selectedXml = renderedPart(selectedDoc);
+		for (const tag of [
+			"w:pgNum",
+			"w:footnoteRef",
+			"w:endnoteRef",
+			"w:dayShort",
+			"w:instrText",
+			"w:contentPart",
+			"w:subDoc",
+		]) {
+			expect(selectedXml).to.include(`<${tag}`);
+		}
+		expect(xmlText(selectedXml)).to.equal("DATESelected");
+		expectWellFormedXml(selectedXml);
+
+		const otherDoc = createDoc(body);
+		otherDoc.render({ enabled: false });
+		const otherXml = renderedPart(otherDoc);
+		expect(xmlText(otherXml)).to.equal("Other");
+		for (const tag of [
+			"w:pgNum",
+			"w:footnoteRef",
+			"w:endnoteRef",
+			"w:dayShort",
+			"w:instrText",
+			"w:contentPart",
+			"w:subDoc",
+		]) {
+			expect(otherXml).to.not.include(`<${tag}`);
+		}
+		expectWellFormedXml(otherXml);
+	});
+
+	it("keeps generated page numbers and run tabs in their physical branch", () => {
+		const body =
+			"<w:p><w:r><w:t>{!switch}{!case first}A</w:t>" +
+			"<w:pgNum/><w:tab/><w:t>{!case second}B{/!switch}</w:t></w:r></w:p>";
+
+		const firstDoc = createDoc(body);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc);
+		expect(xmlText(firstXml)).to.equal("A");
+		expect(firstXml).to.include("<w:pgNum/>");
+		expect(firstXml).to.include("<w:tab/>");
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createDoc(body);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc);
+		expect(xmlText(secondXml)).to.equal("B");
+		expect(secondXml).to.not.include("<w:pgNum");
+		expect(secondXml).to.not.include("<w:tab");
+		expectWellFormedXml(secondXml);
+	});
+
+	it("retains tab-stop formatting for a later branch", () => {
+		const body =
+			"<w:p><w:r><w:t>{!switch}{!case first}A</w:t></w:r></w:p>" +
+			'<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr>' +
+			"<w:r><w:t>{!case second}B{/!switch}</w:t></w:r></w:p>";
+		const doc = createDoc(body);
+		doc.render({ first: false, second: true });
+		const xml = renderedPart(doc);
+		expect(xmlText(xml)).to.equal("B");
+		expect(xml).to.include(
+			'<w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs>'
+		);
+		expectWellFormedXml(xml);
+	});
+
+	it("preserves page-break-before only in its selected branch", () => {
+		const pageBreakCase =
+			"<w:p><w:pPr><w:pageBreakBefore/></w:pPr>" +
+			"<w:r><w:t>{!case enabled}</w:t></w:r></w:p>";
+		const body = [
+			paragraph("{!switch}"),
+			pageBreakCase,
+			paragraph("Selected"),
+			paragraph("{!default}"),
+			paragraph("Other"),
+			paragraph("{/!switch}"),
+		].join("");
+
+		const selectedDoc = createDoc(body);
+		selectedDoc.render({ enabled: true });
+		const selectedXml = renderedPart(selectedDoc);
+		expect(xmlText(selectedXml)).to.equal("Selected");
+		expect(selectedXml).to.include("<w:pageBreakBefore/>");
+		expectWellFormedXml(selectedXml);
+
+		const otherDoc = createDoc(body);
+		otherDoc.render({ enabled: false });
+		const otherXml = renderedPart(otherDoc);
+		expect(xmlText(otherXml)).to.equal("Other");
+		expect(otherXml).to.not.include("<w:pageBreakBefore");
+		expectWellFormedXml(otherXml);
+	});
+
+	it("keeps a semantic later-case Word paragraph with that branch", () => {
+		const laterCase =
+			"<w:p><w:pPr><w:pageBreakBefore/>" +
+			'<w:sectPr><w:type w:val="continuous"/></w:sectPr></w:pPr>' +
+			"<w:r><w:pgNum/><w:t>{!case second}</w:t>" +
+			'<w:br w:type="page"/></w:r></w:p>';
+		const body = [
+			paragraph("{!switch}"),
+			paragraph("{!case first}"),
+			paragraph("A"),
+			laterCase,
+			paragraph("B"),
+			paragraph("{/!switch}"),
+		].join("");
+
+		const firstDoc = createDoc(body);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc);
+		expect(xmlText(firstXml)).to.equal("A");
+		for (const tag of ["w:pageBreakBefore", "w:type", "w:pgNum", "w:br"]) {
+			expect(firstXml).to.not.include(`<${tag}`);
+		}
+		expect((firstXml.match(/<w:p>/g) || []).length).to.equal(1);
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createDoc(body);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc);
+		expect(xmlText(secondXml)).to.equal("B");
+		expect(secondXml).to.include("<w:pageBreakBefore/>");
+		expect(secondXml).to.include('<w:type w:val="continuous"/>');
+		expect(secondXml).to.include("<w:pgNum/>");
+		expect(secondXml).to.include('<w:br w:type="page"/>');
+		expect((secondXml.match(/<w:p>/g) || []).length).to.equal(2);
+		expectWellFormedXml(secondXml);
+	});
+
+	it("does not leak a prior Word run into a later branch", () => {
+		const priorPayload =
+			"<w:p><w:r><w:t>A</w:t></w:r>" +
+			"<w:r><w:rPr><w:b/></w:rPr><w:br/></w:r></w:p>";
+		const laterCase =
+			"<w:p><w:pPr><w:pageBreakBefore/></w:pPr>" +
+			"<w:r><w:t>{!case second}</w:t></w:r></w:p>";
+		const body = [
+			paragraph("{!switch}"),
+			paragraph("{!case first}"),
+			priorPayload,
+			laterCase,
+			paragraph("B"),
+			paragraph("{/!switch}"),
+		].join("");
+
+		const firstDoc = createDoc(body);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc);
+		expect(xmlText(firstXml)).to.equal("A");
+		expect(firstXml).to.include("<w:b/>");
+		expect(firstXml).to.include("<w:br/>");
+		expect((firstXml.match(/<w:p>/g) || []).length).to.equal(1);
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createDoc(body);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc);
+		expect(xmlText(secondXml)).to.equal("B");
+		expect(secondXml).to.not.include("<w:b/>");
+		expect(secondXml).to.not.include("<w:br/>");
+		expect((secondXml.match(/<w:p>/g) || []).length).to.equal(2);
+		expect(
+			directElementChildNames(secondXml, "w:body").every((name) =>
+				["w:p", "w:sectPr"].includes(name)
+			)
+		).to.equal(true);
+		expectWellFormedXml(secondXml);
+	});
+
+	it("keeps a layout-only paragraph only in its physical branch", () => {
+		const priorLayout =
+			"<w:p><w:pPr><w:keepNext/>" +
+			'<w:spacing w:before="999"/></w:pPr></w:p>';
+		const laterCase =
+			"<w:p><w:pPr><w:pageBreakBefore/></w:pPr>" +
+			"<w:r><w:t>{!case second}</w:t></w:r></w:p>";
+		const body = [
+			paragraph("{!switch}"),
+			paragraph("{!case first}"),
+			paragraph("A"),
+			priorLayout,
+			laterCase,
+			paragraph("B"),
+			paragraph("{/!switch}"),
+		].join("");
+
+		const firstDoc = createDoc(body);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc);
+		expect(xmlText(firstXml)).to.equal("A");
+		expect(firstXml).to.include("<w:keepNext/>");
+		expect(firstXml).to.include('<w:spacing w:before="999"/>');
+		expect((firstXml.match(/<w:p>/g) || []).length).to.equal(2);
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createDoc(body);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc);
+		expect(xmlText(secondXml)).to.equal("B");
+		expect(secondXml).to.not.include("<w:keepNext");
+		expect(secondXml).to.not.include("<w:spacing");
+		expect((secondXml.match(/<w:p>/g) || []).length).to.equal(2);
+		expectWellFormedXml(secondXml);
+	});
+
+	it("keeps breaks and drawings in the branch that contains them", () => {
+		const body =
+			"<w:p><w:r><w:t>{!switch}{!case first}A</w:t></w:r>" +
+			'<w:r><w:br/><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"/></w:drawing></w:r>' +
+			"<w:r><w:rPr><w:i/></w:rPr><w:t>{!case second}B{/!switch}</w:t></w:r></w:p>";
+
+		const firstDoc = createDoc(body);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc);
+		expect(xmlText(firstXml)).to.equal("A");
+		expect(firstXml).to.include("<w:br/>");
+		expect(firstXml).to.include("<w:drawing>");
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createDoc(body);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc);
+		const selectedRun = runContaining(secondXml, "B");
+		expect(xmlText(secondXml)).to.equal("B");
+		expect(secondXml).to.not.include("<w:br/>");
+		expect(secondXml).to.not.include("<w:drawing>");
+		expect(selectedRun).to.include("<w:i/>");
+		expectWellFormedXml(secondXml);
+	});
+
+	it("keeps complete inline content containers in their original branch", () => {
+		const body =
+			"<w:p><w:r><w:t>{!switch}{!case first}A</w:t></w:r>" +
+			'<w:hyperlink w:anchor="target"><w:r><w:t>LINK</w:t></w:r></w:hyperlink>' +
+			'<w:ins w:id="7"><w:r><w:t>INSERTED</w:t></w:r></w:ins>' +
+			'<w:fldSimple w:instr="DATE"><w:r><w:t>FIELD</w:t></w:r></w:fldSimple>' +
+			'<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>MATH</m:t></m:r></m:oMath>' +
+			"<w:r><w:rPr><w:i/></w:rPr><w:t>{!case second}B{/!switch}</w:t></w:r></w:p>";
+
+		const firstDoc = createDoc(body);
+		firstDoc.render({ first: true, second: false });
+		const firstXml = renderedPart(firstDoc);
+		expect(xmlText(firstXml)).to.equal("ALINKINSERTEDFIELDMATH");
+		for (const tag of ["w:hyperlink", "w:ins", "w:fldSimple", "m:oMath"]) {
+			expect(firstXml).to.include(`<${tag}`);
+		}
+		expectWellFormedXml(firstXml);
+
+		const secondDoc = createDoc(body);
+		secondDoc.render({ first: false, second: true });
+		const secondXml = renderedPart(secondDoc);
+		expect(xmlText(secondXml)).to.equal("B");
+		for (const tag of ["w:hyperlink", "w:ins", "w:fldSimple", "m:oMath"]) {
+			expect(secondXml).to.not.include(`<${tag}`);
+		}
+		expect(runContaining(secondXml, "B")).to.include("<w:i/>");
+		expectWellFormedXml(secondXml);
+	});
+
+	it("preserves Office Math run properties in a later branch", () => {
+		const body =
+			'<w:p><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">' +
+			"<m:r><m:t>{!switch}{!case first}A</m:t></m:r>" +
+			'<m:r><m:rPr><m:sty m:val="b"/></m:rPr>' +
+			"<m:t>{!case second}B{/!switch}POST</m:t></m:r></m:oMath></w:p>";
+
+		for (const [data, expected] of [
+			[{ first: true, second: false }, "APOST"],
+			[{ first: false, second: true }, "BPOST"],
+		]) {
+			const doc = createDoc(body);
+			doc.render(data);
+			const xml = renderedPart(doc);
+			expect(xmlText(xml)).to.equal(expected);
+			expect(xml).to.include('<m:rPr><m:sty m:val="b"/></m:rPr>');
+			expectWellFormedXml(xml);
+		}
+	});
+
+	it("preserves structural XML mixed with visible branch markers", () => {
+		const body =
+			"<w:p><w:r><w:t>{!switch}{!case first}A</w:t></w:r>" +
+			'<w:proofErr w:type="spellStart"/><w:proofErr w:type="spellEnd"/>' +
+			'<w:hyperlink w:anchor="target"><w:r></w:r></w:hyperlink>' +
+			"<w:r><w:t>{!case second}B{/!switch}</w:t></w:r></w:p>";
+
+		for (const [data, expected, proofErrors, hyperlinks] of [
+			[{ first: true, second: false }, "A", 2, 1],
+			[{ first: false, second: true }, "B", 0, 0],
+		]) {
+			const doc = createDoc(body);
+			doc.render(data);
+			const xml = renderedPart(doc);
+			expect(xmlText(xml)).to.equal(expected);
+			expect((xml.match(/<w:proofErr\b/g) || []).length).to.equal(
+				proofErrors
+			);
+			expect((xml.match(/<w:hyperlink\b/g) || []).length).to.equal(
+				hyperlinks
+			);
+			expectWellFormedXml(xml);
+		}
 	});
 
 	it("preserves matching bookmark tags in a selected branch", () => {
@@ -423,6 +1247,58 @@ describe("private conditional switch module", () => {
 		);
 		expect(xml).to.include('<w:bookmarkEnd w:id="7"/>');
 		expectWellFormedXml(xml);
+	});
+
+	it("preserves a comment reference in a selected branch", () => {
+		const body = [
+			paragraph("{!switch}"),
+			'<w:p><w:r><w:t>{!case enabled}</w:t></w:r><w:r><w:commentReference w:id="7"/></w:r></w:p>',
+			paragraph("Selected"),
+			paragraph("{!default}"),
+			paragraph("Other"),
+			paragraph("{/!switch}"),
+		].join("");
+		const doc = createDoc(body);
+		doc.render({ enabled: true });
+		const xml = renderedPart(doc);
+		expect(xmlText(xml)).to.equal("Selected");
+		expect(xml).to.include('<w:commentReference w:id="7"/>');
+		expect((xml.match(/<w:p>/g) || []).length).to.equal(2);
+		expectWellFormedXml(xml);
+	});
+
+	it("preserves section and permission markers only in their branch", () => {
+		const markedCase =
+			'<w:p><w:pPr><w:sectPr><w:type w:val="continuous"/></w:sectPr></w:pPr>' +
+			'<w:permStart w:id="9" w:edGrp="everyone"/><w:r><w:t>{!case enabled}</w:t></w:r><w:permEnd w:id="9"/></w:p>';
+		const body = [
+			paragraph("{!switch}"),
+			markedCase,
+			paragraph("Selected"),
+			paragraph("{!default}"),
+			paragraph("Other"),
+			paragraph("{/!switch}"),
+		].join("");
+
+		const selectedDoc = createDoc(body);
+		selectedDoc.render({ enabled: true });
+		const selectedXml = renderedPart(selectedDoc);
+		expect(xmlText(selectedXml)).to.equal("Selected");
+		expect(selectedXml).to.include('<w:type w:val="continuous"/>');
+		expect(selectedXml).to.include(
+			'<w:permStart w:id="9" w:edGrp="everyone"/>'
+		);
+		expect(selectedXml).to.include('<w:permEnd w:id="9"/>');
+		expectWellFormedXml(selectedXml);
+
+		const otherDoc = createDoc(body);
+		otherDoc.render({ enabled: false });
+		const otherXml = renderedPart(otherDoc);
+		expect(xmlText(otherXml)).to.equal("Other");
+		expect(otherXml).to.not.include('<w:type w:val="continuous"/>');
+		expect(otherXml).to.not.include("<w:permStart");
+		expect(otherXml).to.not.include("<w:permEnd");
+		expectWellFormedXml(otherXml);
 	});
 
 	it("compiles each placeholder in branch content once", () => {

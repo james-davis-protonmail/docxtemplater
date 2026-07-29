@@ -2,6 +2,84 @@
 
 const MODULE_NAME = "private-conditional-switch";
 
+const RELOCATABLE_XML_CONTAINERS = new Set([
+	"w:p",
+	"w:r",
+	"w:t",
+	"a:p",
+	"a:r",
+	"a:t",
+	"m:r",
+	"m:t",
+]);
+
+const PROPERTY_XML_PARENTS = new Map([
+	["a:endParaRPr", new Set(["a:p"])],
+	["a:pPr", new Set(["a:fld", "a:p"])],
+	["a:rPr", new Set(["a:br", "a:fld", "a:r"])],
+	["m:oMathParaPr", new Set(["m:oMathPara"])],
+	["m:rPr", new Set(["m:r"])],
+	["w:pPr", new Set(["w:p"])],
+	["w:rPr", new Set(["w:r"])],
+]);
+
+const PARAGRAPH_SEMANTIC_XML_TAGS = new Set([
+	"a:br",
+	"a:fld",
+	"a14:m",
+	"w:annotationRef",
+	"w:bookmarkEnd",
+	"w:bookmarkStart",
+	"w:br",
+	"w:commentRangeEnd",
+	"w:commentRangeStart",
+	"w:commentReference",
+	"w:contentPart",
+	"w:continuationSeparator",
+	"w:cr",
+	"w:customXmlDelRangeEnd",
+	"w:customXmlDelRangeStart",
+	"w:customXmlInsRangeEnd",
+	"w:customXmlInsRangeStart",
+	"w:customXmlMoveFromRangeEnd",
+	"w:customXmlMoveFromRangeStart",
+	"w:customXmlMoveToRangeEnd",
+	"w:customXmlMoveToRangeStart",
+	"w:dayLong",
+	"w:dayShort",
+	"w:delInstrText",
+	"w:delText",
+	"w:drawing",
+	"w:endnoteRef",
+	"w:endnoteReference",
+	"w:fldChar",
+	"w:fldSimple",
+	"w:footnoteRef",
+	"w:footnoteReference",
+	"w:instrText",
+	"w:monthLong",
+	"w:monthShort",
+	"w:moveFromRangeEnd",
+	"w:moveFromRangeStart",
+	"w:moveToRangeEnd",
+	"w:moveToRangeStart",
+	"w:noBreakHyphen",
+	"w:object",
+	"w:permEnd",
+	"w:permStart",
+	"w:pict",
+	"w:pgNum",
+	"w:ptab",
+	"w:ruby",
+	"w:separator",
+	"w:sectPr",
+	"w:softHyphen",
+	"w:subDoc",
+	"w:sym",
+	"w:yearLong",
+	"w:yearShort",
+]);
+
 function exactTag(expected) {
 	return (tag) => (tag.trim() === expected ? "." : false);
 }
@@ -56,66 +134,172 @@ function isParagraphEnd(part) {
 	);
 }
 
+function findXmlTagEnd(value, start) {
+	let quote = null;
+	for (let index = start + 1; index < value.length; index++) {
+		const character = value[index];
+		if (quote) {
+			if (character === quote) {
+				quote = null;
+			}
+			continue;
+		}
+		if (character === '"' || character === "'") {
+			quote = character;
+		} else if (character === ">") {
+			return index;
+		}
+	}
+	return -1;
+}
+
+function getRawXmlEvents(value) {
+	const events = [];
+	let index = 0;
+	while (index < value.length) {
+		const start = value.indexOf("<", index);
+		if (start === -1) {
+			break;
+		}
+		if (value.startsWith("<!--", start)) {
+			const end = value.indexOf("-->", start + 4);
+			index = end === -1 ? value.length : end + 3;
+			continue;
+		}
+		if (value.startsWith("<![CDATA[", start)) {
+			const end = value.indexOf("]]>", start + 9);
+			index = end === -1 ? value.length : end + 3;
+			continue;
+		}
+
+		const end = findXmlTagEnd(value, start);
+		if (end === -1) {
+			break;
+		}
+		let rawTag = value.slice(start + 1, end).trim();
+		index = end + 1;
+		if (!rawTag || rawTag[0] === "!" || rawTag[0] === "?") {
+			continue;
+		}
+
+		let position = "start";
+		if (rawTag[0] === "/") {
+			position = "end";
+			rawTag = rawTag.slice(1).trim();
+		} else if (rawTag.endsWith("/")) {
+			position = "selfclosing";
+			rawTag = rawTag.slice(0, -1).trim();
+		}
+		const tag = rawTag.split(/\s/, 1)[0];
+		if (/^[A-Za-z_][A-Za-z0-9_.:-]*$/.test(tag)) {
+			events.push({ tag, position, start, end: end + 1 });
+		}
+	}
+	return events;
+}
+
+function getXmlEvents(part) {
+	if (part.type === "tag") {
+		return [{ tag: part.tag, position: part.position }];
+	}
+	if (part.type === "content" && part.position === "outsidetag") {
+		return getRawXmlEvents(part.value || "");
+	}
+	return [];
+}
+
+function getXmlEventValue(part, event) {
+	if (part.type === "content" && part.position === "outsidetag") {
+		return (part.value || "").slice(event.start, event.end);
+	}
+	return part.value || "";
+}
+
+function updateXmlStack(stack, event) {
+	if (event.position === "start") {
+		stack.push(event.tag);
+		return;
+	}
+	if (event.position === "end" && stack[stack.length - 1] === event.tag) {
+		stack.pop();
+	}
+}
+
+function isParagraphSemanticXmlEvent(event, xmlStack) {
+	if (event.position === "end") {
+		return false;
+	}
+	const parent = xmlStack[xmlStack.length - 1];
+	if (event.tag === "w:tab") {
+		return parent === "w:r";
+	}
+	if (event.tag === "w:pageBreakBefore") {
+		return parent === "w:pPr";
+	}
+	return PARAGRAPH_SEMANTIC_XML_TAGS.has(event.tag);
+}
+
+function updateParagraphFrame(frame, part, xmlStack) {
+	if (isControl(part)) {
+		frame.hasControl = true;
+	} else if (
+		part.type === "placeholder" ||
+		(part.type === "content" &&
+			part.position === "insidetag" &&
+			(part.value || "").trim() !== "")
+	) {
+		frame.hasSemanticContent = true;
+	}
+	for (const event of getXmlEvents(part)) {
+		if (isParagraphSemanticXmlEvent(event, xmlStack)) {
+			frame.hasSemanticContent = true;
+		}
+		updateXmlStack(xmlStack, event);
+	}
+}
+
 /*
- * Word places a tag typed on its own line inside a complete paragraph/run/text
+ * Office places a tag typed on its own line inside a complete paragraph/run/text
  * scaffold. Mark that scaffold so it can be omitted together with the control
  * tag, without expanding inline switches to paragraph boundaries.
  */
-// eslint-disable-next-line complexity
 function markControlOnlyParagraphs(parsed) {
-	let start = -1;
-	let depth = 0;
+	const frames = [];
+	const xmlStack = [];
 
 	for (let i = 0; i < parsed.length; i++) {
 		const part = parsed[i];
 		if (isParagraphStart(part)) {
-			if (depth === 0) {
-				start = i;
+			frames.push({
+				tag: part.tag,
+				start: i,
+				hasControl: false,
+				hasSemanticContent: false,
+			});
+		}
+		const frame = frames[frames.length - 1];
+		if (frame) {
+			updateParagraphFrame(frame, part, xmlStack);
+		} else {
+			for (const event of getXmlEvents(part)) {
+				updateXmlStack(xmlStack, event);
 			}
-			depth++;
 		}
-		if (!isParagraphEnd(part)) {
-			continue;
-		}
-		depth--;
-		if (depth !== 0 || start === -1) {
+		if (!isParagraphEnd(part) || !frame || frame.tag !== part.tag) {
 			continue;
 		}
 
-		const paragraph = parsed.slice(start, i + 1);
-		let controls = 0;
-		let hasVisibleContent = false;
-		for (const paragraphPart of paragraph) {
-			if (isControl(paragraphPart)) {
-				controls++;
-			} else if (paragraphPart.type === "placeholder") {
-				hasVisibleContent = true;
-			} else if (
-				paragraphPart.type === "tag" &&
-				paragraphPart.position === "selfclosing" &&
-				[
-					"w:br",
-					"w:bookmarkStart",
-					"w:bookmarkEnd",
-					"w:commentRangeStart",
-					"w:commentRangeEnd",
-				].includes(paragraphPart.tag)
-			) {
-				hasVisibleContent = true;
-			} else if (
-				paragraphPart.type === "content" &&
-				paragraphPart.value &&
-				paragraphPart.value.trim() !== ""
-			) {
-				hasVisibleContent = true;
-			}
-		}
-		if (controls > 0 && !hasVisibleContent) {
-			for (let j = start; j <= i; j++) {
+		frames.pop();
+		if (frame.hasControl && !frame.hasSemanticContent) {
+			for (let j = frame.start; j <= i; j++) {
 				parsed[j].switchControlScaffold = true;
 			}
 		}
-		start = -1;
+		const parent = frames[frames.length - 1];
+		if (parent) {
+			parent.hasControl ||= frame.hasControl;
+			parent.hasSemanticContent ||= frame.hasSemanticContent;
+		}
 	}
 }
 
@@ -135,23 +319,263 @@ function unique(values) {
 	return [...new Set(values.filter(Boolean))];
 }
 
-function isVisibleBranchPart(part) {
+function isPropertyForOwner(tag, ownerTag) {
+	const parents = PROPERTY_XML_PARENTS.get(tag);
+	if (parents) {
+		return parents.has(ownerTag);
+	}
 	return (
-		part.type === "placeholder" ||
-		(part.type === "content" && part.position === "insidetag")
+		tag.startsWith("m:") && tag.endsWith("Pr") && ownerTag.startsWith("m:")
 	);
 }
 
-function takeTrailingTransition(parts) {
-	const lastPart = parts[parts.length - 1];
-	if (!lastPart || lastPart.type !== "tag" || lastPart.position !== "start") {
+function extractPropertyXml(value, ownerTag) {
+	let result = "";
+	let captureStart = -1;
+	let captureDepth = 0;
+
+	for (const event of getRawXmlEvents(value)) {
+		if (captureStart !== -1) {
+			if (event.position === "start") {
+				captureDepth++;
+			} else if (event.position === "end") {
+				captureDepth--;
+				if (captureDepth === 0) {
+					result += value.slice(captureStart, event.end);
+					captureStart = -1;
+				}
+			}
+			continue;
+		}
+		if (!isPropertyForOwner(event.tag, ownerTag)) {
+			continue;
+		}
+		if (event.position === "selfclosing") {
+			result += value.slice(event.start, event.end);
+		} else if (event.position === "start") {
+			captureStart = event.start;
+			captureDepth = 1;
+		}
+	}
+	return result;
+}
+
+function commonPhysicalContext(left, right) {
+	let length = 0;
+	while (
+		length < left.length &&
+		length < right.length &&
+		left[length].tag === right[length].tag &&
+		left[length].id === right[length].id &&
+		left[length].source === right[length].source
+	) {
+		length++;
+	}
+	return left.slice(0, length);
+}
+
+/*
+ * Equal tag stacks are not enough: two w:r/a:r elements can have different
+ * formatting. Close the selected branch's exact physical context, then reopen
+ * the context containing {/!switch} with that context's paragraph/run
+ * properties so content after the switch stays in its original container.
+ */
+function makeDirectContextBridge(currentContext, exitContext, anchorPart) {
+	const common = commonPhysicalContext(currentContext, exitContext);
+	const currentSuffix = currentContext.slice(common.length);
+	const exitSuffix = exitContext.slice(common.length);
+	if (
+		[...currentSuffix, ...exitSuffix].some(
+			(frame) => !RELOCATABLE_XML_CONTAINERS.has(frame.tag)
+		)
+	) {
 		return [];
 	}
-	let index = parts.length - 1;
-	while (index >= 0 && !isVisibleBranchPart(parts[index])) {
-		index--;
+
+	let value = "";
+	for (let index = currentSuffix.length - 1; index >= 0; index--) {
+		value += `</${currentSuffix[index].tag}>`;
 	}
-	return parts.splice(index + 1);
+	for (let index = 0; index < exitSuffix.length; index++) {
+		const frame = exitSuffix[index];
+		value += frame.openXml;
+		const next = exitSuffix[index + 1];
+		if (next && frame.source === next.source) {
+			value += extractPropertyXml(
+				frame.source.xml.slice(frame.openEnd, next.openStart),
+				frame.tag
+			);
+		}
+	}
+	if (!value) {
+		return [];
+	}
+	return [
+		{
+			type: "content",
+			position: "outsidetag",
+			value,
+			lIndex: anchorPart.lIndex,
+			offset: anchorPart.offset,
+		},
+	];
+}
+
+function updateReverseContainerStack(events, stack) {
+	for (let index = events.length - 1; index >= 0; index--) {
+		const event = events[index];
+		if (
+			event.position === "selfclosing" ||
+			RELOCATABLE_XML_CONTAINERS.has(event.tag)
+		) {
+			continue;
+		}
+		if (event.position === "end") {
+			stack.push(event.tag);
+		} else if (
+			event.position === "start" &&
+			stack[stack.length - 1] === event.tag
+		) {
+			stack.pop();
+		}
+	}
+}
+
+function findTrailingTransitionIndex(parts) {
+	const containerStack = [];
+	for (let index = parts.length - 1; index >= 0; index--) {
+		const part = parts[index];
+		updateReverseContainerStack(getXmlEvents(part), containerStack);
+		if (
+			containerStack.length === 0 &&
+			(part.type === "placeholder" ||
+				(part.type === "content" && part.position === "insidetag"))
+		) {
+			return index + 1;
+		}
+	}
+	return 0;
+}
+
+function findTargetPrefix(parts) {
+	const stack = [];
+	for (let index = 0; index < parts.length; index++) {
+		for (const event of getXmlEvents(parts[index])) {
+			if (
+				event.position === "selfclosing" ||
+				!RELOCATABLE_XML_CONTAINERS.has(event.tag)
+			) {
+				continue;
+			}
+			if (event.position === "start") {
+				stack.push({ tag: event.tag, index, event });
+			} else if (
+				event.position === "end" &&
+				stack[stack.length - 1] &&
+				stack[stack.length - 1].tag === event.tag
+			) {
+				stack.pop();
+			}
+		}
+	}
+	if (stack.length === 0) {
+		return {
+			priorBridge: parts.slice(),
+			targetPrefix: [],
+			openCount: 0,
+		};
+	}
+
+	const first = stack[0];
+	const priorBridge = parts.slice(0, first.index);
+	const targetPrefix = parts.slice(first.index + 1);
+	const boundaryPart = parts[first.index];
+	if (
+		boundaryPart.type === "content" &&
+		boundaryPart.position === "outsidetag"
+	) {
+		const before = boundaryPart.value.slice(0, first.event.start);
+		const after = boundaryPart.value.slice(first.event.start);
+		if (before) {
+			priorBridge.push({ ...boundaryPart, value: before });
+		}
+		if (after) {
+			targetPrefix.unshift({ ...boundaryPart, value: after });
+		}
+	} else {
+		targetPrefix.unshift(boundaryPart);
+	}
+	return {
+		priorBridge,
+		targetPrefix,
+		openCount: stack.length,
+	};
+}
+
+/*
+ * A previous branch can end by closing containers that were already open at
+ * the switch, then pass through complete paragraphs/runs before the next case.
+ * The next branch needs those initial closing tags, but none of the balanced
+ * detours owned by the previous branch.
+ */
+function clonePriorBridge(parts, initialXmlStack) {
+	const result = [];
+	const stack = initialXmlStack.map((tag) => ({ tag, initial: true }));
+
+	function shouldKeep(event) {
+		if (event.position === "start") {
+			stack.push({ tag: event.tag, initial: false });
+			return false;
+		}
+		if (event.position !== "end") {
+			return false;
+		}
+		const current = stack[stack.length - 1];
+		if (!current || current.tag !== event.tag) {
+			return false;
+		}
+		stack.pop();
+		return current.initial;
+	}
+
+	for (const part of parts) {
+		if (part.type === "content" && part.position === "outsidetag") {
+			let value = "";
+			for (const event of getRawXmlEvents(part.value || "")) {
+				if (shouldKeep(event)) {
+					value += part.value.slice(event.start, event.end);
+				}
+			}
+			if (value) {
+				result.push({ ...part, value });
+			}
+			continue;
+		}
+
+		if (getXmlEvents(part).some(shouldKeep)) {
+			result.push({ ...part });
+		}
+	}
+	return result;
+}
+
+function takeTrailingTransition(parts, entryXmlStack) {
+	const index = findTrailingTransitionIndex(parts);
+	const transition = parts.slice(index);
+	if (!entryXmlStack) {
+		return { leadingContent: [], openCount: 0 };
+	}
+
+	const { priorBridge, targetPrefix, openCount } =
+		findTargetPrefix(transition);
+	parts.splice(index, transition.length, ...priorBridge);
+	return {
+		leadingContent: [
+			...clonePriorBridge(priorBridge, entryXmlStack),
+			...targetPrefix,
+		],
+		openCount,
+	};
 }
 
 function findResolvedPart(scopeManager, part) {
@@ -171,11 +595,28 @@ function findResolvedPart(scopeManager, part) {
 	return resolved.find((item) => item.lIndex === part.lIndex) || null;
 }
 
+function findMatchingSwitchEndIndex(parsed, startIndex) {
+	let depth = 0;
+	for (let index = startIndex + 1; index < parsed.length; index++) {
+		if (isControl(parsed[index], "switch")) {
+			depth++;
+		} else if (isControl(parsed[index], "end")) {
+			if (depth === 0) {
+				return index;
+			}
+			depth--;
+		}
+	}
+	return -1;
+}
+
 class ConditionalSwitchModule {
 	constructor() {
 		this.name = "ConditionalSwitchModule";
 		this.priority = 100;
 		this.requiredAPIVersion = "3.47.2";
+		this.supportedFileTypes = ["docx", "pptx"];
+		this.xmlContexts = new WeakMap();
 	}
 
 	clone() {
@@ -271,9 +712,141 @@ class ConditionalSwitchModule {
 
 	postparse(parsed, options) {
 		markControlOnlyParagraphs(parsed);
+		this.ensureXmlContexts(parsed);
 		const errors = [];
 		const result = this.groupLevel(parsed, options, errors, false);
 		return { postparsed: result.parts, errors };
+	}
+
+	ensureXmlContexts(parsed) {
+		const controls = parsed.filter((part) => isControl(part));
+		if (
+			controls.length === 0 ||
+			controls.some((part) => this.xmlContexts.has(part))
+		) {
+			return;
+		}
+
+		const stack = [];
+		const source = { chunks: [], length: 0, xml: "" };
+		let nextId = 0;
+		for (const part of parsed) {
+			if (isControl(part)) {
+				this.xmlContexts.set(part, stack.slice());
+			}
+			if (part.switchControlScaffold) {
+				continue;
+			}
+			for (const event of getXmlEvents(part)) {
+				const openXml = getXmlEventValue(part, event);
+				const openStart = source.length;
+				source.chunks.push(openXml);
+				source.length += openXml.length;
+				const openEnd = source.length;
+				if (event.position === "start") {
+					stack.push({
+						tag: event.tag,
+						id: nextId++,
+						openXml,
+						openStart,
+						openEnd,
+						source,
+					});
+				} else if (event.position === "end") {
+					const current = stack[stack.length - 1];
+					if (current && current.tag === event.tag) {
+						stack.pop();
+					}
+				}
+			}
+		}
+		source.xml = source.chunks.join("");
+		delete source.chunks;
+		delete source.length;
+	}
+
+	hasSameProtectedContext(left, right) {
+		const leftProtected = left.filter(
+			(item) => !RELOCATABLE_XML_CONTAINERS.has(item.tag)
+		);
+		const rightProtected = right.filter(
+			(item) => !RELOCATABLE_XML_CONTAINERS.has(item.tag)
+		);
+		if (leftProtected.length !== rightProtected.length) {
+			return false;
+		}
+		return leftProtected.every(
+			(item, index) =>
+				item.tag === rightProtected[index].tag &&
+				item.id === rightProtected[index].id
+		);
+	}
+
+	branchMatchesContext(branch, entryContext, exitContext) {
+		const stack = entryContext.map((item) => item.tag);
+		for (const part of branch.rawContent) {
+			if (part.switchControlScaffold) {
+				continue;
+			}
+			for (const event of getXmlEvents(part)) {
+				if (event.position === "start") {
+					stack.push(event.tag);
+				} else if (event.position === "end") {
+					if (stack[stack.length - 1] !== event.tag) {
+						return false;
+					}
+					stack.pop();
+				}
+			}
+		}
+		const expected = exitContext.map((item) => item.tag);
+		return (
+			stack.length === expected.length &&
+			stack.every((tag, index) => tag === expected[index])
+		);
+	}
+
+	validateSwitchStructure(switchPart, endPart, branches, errors) {
+		const entryContext = this.xmlContexts.get(switchPart);
+		const exitContext = this.xmlContexts.get(endPart);
+		const controls = [
+			switchPart,
+			...branches.map((branch) => branch.controlPart),
+			endPart,
+		];
+		if (
+			!entryContext ||
+			!exitContext ||
+			controls.some((part) => !this.xmlContexts.has(part))
+		) {
+			return;
+		}
+
+		const crossesContainer = controls.some((part) => {
+			const context = this.xmlContexts.get(part);
+			return !this.hasSameProtectedContext(entryContext, context);
+		});
+		const invalidBranch = branches.find(
+			(branch) =>
+				!this.branchMatchesContext(branch, entryContext, exitContext)
+		);
+		if (!crossesContainer && !invalidBranch) {
+			return;
+		}
+
+		errors.push(
+			makeTemplateError(
+				"conditional_switch_invalid_structure",
+				"A {!switch} block crosses incompatible document XML containers. Keep the switch and all branch controls within the same table cell, hyperlink, and content container.",
+				switchPart,
+				{
+					branch:
+						invalidBranch && invalidBranch.kind === "case"
+							? invalidBranch.expression
+							: invalidBranch && invalidBranch.kind,
+				}
+			)
+		);
 	}
 
 	groupLevel(parsed, options, errors, insideSwitch) {
@@ -331,6 +904,14 @@ class ConditionalSwitchModule {
 	// eslint-disable-next-line complexity
 	groupSwitch(parsed, startIndex, options, errors) {
 		const switchPart = parsed[startIndex];
+		const matchingEndIndex = findMatchingSwitchEndIndex(parsed, startIndex);
+		const entryContext = this.xmlContexts.get(switchPart);
+		const exitContext =
+			matchingEndIndex === -1
+				? null
+				: this.xmlContexts.get(parsed[matchingEndIndex]);
+		const entryXmlStack =
+			entryContext && entryContext.map((item) => item.tag);
 		const branches = [];
 		let currentBranch = null;
 		let defaultSeen = false;
@@ -377,6 +958,7 @@ class ConditionalSwitchModule {
 			}
 
 			if (depth === 0 && isControl(part, "case")) {
+				const controlContext = this.xmlContexts.get(part);
 				if (part.emptyCase) {
 					part.value = "";
 				}
@@ -400,14 +982,30 @@ class ConditionalSwitchModule {
 						)
 					);
 				}
-				const leadingContent = currentBranch
-					? takeTrailingTransition(currentBranch.rawContent)
+				const transition = currentBranch
+					? takeTrailingTransition(
+							currentBranch.rawContent,
+							entryXmlStack
+						)
+					: null;
+				if (currentBranch && controlContext) {
+					currentBranch.endContext = controlContext.slice(
+						0,
+						Math.max(
+							0,
+							controlContext.length - transition.openCount
+						)
+					);
+				}
+				const leadingContent = transition
+					? transition.leadingContent
 					: pendingContent;
 				pendingContent = [];
 				currentBranch = {
 					kind: "case",
 					expression: part.value,
 					controlPart: part,
+					controlContext,
 					rawContent: leadingContent,
 				};
 				branches.push(currentBranch);
@@ -415,6 +1013,7 @@ class ConditionalSwitchModule {
 			}
 
 			if (depth === 0 && isControl(part, "default")) {
+				const controlContext = this.xmlContexts.get(part);
 				if (defaultSeen) {
 					errors.push(
 						makeTemplateError(
@@ -425,14 +1024,30 @@ class ConditionalSwitchModule {
 					);
 				}
 				defaultSeen = true;
-				const leadingContent = currentBranch
-					? takeTrailingTransition(currentBranch.rawContent)
+				const transition = currentBranch
+					? takeTrailingTransition(
+							currentBranch.rawContent,
+							entryXmlStack
+						)
+					: null;
+				if (currentBranch && controlContext) {
+					currentBranch.endContext = controlContext.slice(
+						0,
+						Math.max(
+							0,
+							controlContext.length - transition.openCount
+						)
+					);
+				}
+				const leadingContent = transition
+					? transition.leadingContent
 					: pendingContent;
 				pendingContent = [];
 				currentBranch = {
 					kind: "default",
 					expression: null,
 					controlPart: part,
+					controlContext,
 					rawContent: leadingContent,
 				};
 				branches.push(currentBranch);
@@ -469,6 +1084,40 @@ class ConditionalSwitchModule {
 			);
 		}
 
+		if (foundEnd) {
+			if (currentBranch) {
+				currentBranch.endContext = exitContext;
+			}
+			for (const branch of branches.slice(0, -1)) {
+				if (branch.endContext && exitContext) {
+					branch.rawContent.push(
+						...makeDirectContextBridge(
+							branch.endContext,
+							exitContext,
+							parsed[endIndex]
+						)
+					);
+				}
+			}
+			this.validateSwitchStructure(
+				switchPart,
+				parsed[endIndex],
+				branches,
+				errors
+			);
+		}
+
+		const emptyContent =
+			foundEnd && entryContext && exitContext
+				? options.postparse(
+						makeDirectContextBridge(
+							entryContext,
+							exitContext,
+							parsed[endIndex]
+						),
+						{ basePart: switchPart }
+					)
+				: [];
 		for (const branch of branches) {
 			branch.content = options.postparse(branch.rawContent, {
 				basePart: switchPart,
@@ -504,6 +1153,7 @@ class ConditionalSwitchModule {
 			...switchPart,
 			dataBound: false,
 			branches,
+			emptyContent,
 			subparsed: branches.map((branch) => branch.discoveryPart),
 			endLindex: foundEnd ? parsed[endIndex].lIndex : switchPart.lIndex,
 		};
@@ -597,9 +1247,6 @@ class ConditionalSwitchModule {
 			options.scopeManager,
 			resolvedEntries
 		);
-		if (!selected) {
-			return { value: "" };
-		}
 
 		let branchScope = options.scopeManager;
 		if (resolvedEntries) {
@@ -609,7 +1256,7 @@ class ConditionalSwitchModule {
 		}
 		const subRendered = options.render({
 			...options,
-			compiled: selected.content,
+			compiled: selected ? selected.content : part.emptyContent,
 			tags: {},
 			scopeManager: branchScope,
 		});
