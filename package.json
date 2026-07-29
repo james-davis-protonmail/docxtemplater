@@ -113,6 +113,7 @@
     "test:es6:update-snapshots": "cross-env WRITE_SNAPSHOTS=true mocha --full-trace --check-leaks es6/tests/index.js",
     "test:es6:fast": "cross-env FAST=true mocha --full-trace --check-leaks es6/tests/index.js",
     "test:watch": "cross-env FAST=true mocha --watch --full-trace --check-leaks es6/tests/index.js",
+    "test:switch": "node conditional-switch-module/run-tests.js",
     "test:es6:slow": "cross-env FAST= mocha --full-trace --check-leaks es6/tests/index.js",
     "test": "npm run convertto:es5 && npm run mocha",
     "test:es5": "npm test",
