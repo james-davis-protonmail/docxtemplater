@@ -1,5 +1,6 @@
 "use strict";
 
+const { DOMParser } = require("@xmldom/xmldom");
 const { expect } = require("chai");
 const PizZip = require("pizzip");
 const Docxtemplater = require("../es6/docxtemplater.js");
@@ -98,6 +99,24 @@ function renderText(template, data, options) {
 
 function getErrors(error) {
 	return error.properties.errors || [error];
+}
+
+function expectWellFormedXml(xml) {
+	expect(() =>
+		new DOMParser({
+			onError(level, message) {
+				if (level !== "warning") {
+					throw new Error(message);
+				}
+			},
+		}).parseFromString(xml, "text/xml")
+	).to.not.throw();
+}
+
+function runContaining(xml, text) {
+	return (xml.match(/<w:r(?:\s[^>]*)?>[\s\S]*?<\/w:r>/g) || []).find((run) =>
+		xmlText(run).includes(text)
+	);
 }
 
 describe("private conditional switch module", () => {
@@ -230,6 +249,27 @@ describe("private conditional switch module", () => {
 		).to.equal("VIP / DUE");
 	});
 
+	it("supports nested multiline switches with control-only paragraphs", () => {
+		const template = [
+			paragraph("{!switch}"),
+			paragraph("{!case outer}"),
+			paragraph("{!switch}"),
+			paragraph("{!case inner}"),
+			paragraph("INNER"),
+			paragraph("{!default}"),
+			paragraph("INNER DEFAULT"),
+			paragraph("{/!switch}"),
+			paragraph("{!default}"),
+			paragraph("OUTER DEFAULT"),
+			paragraph("{/!switch}"),
+		].join("");
+		const doc = createDoc(template);
+		doc.render({ outer: true, inner: false });
+		const xml = renderedPart(doc);
+		expect(xmlText(xml)).to.equal("INNER DEFAULT");
+		expect((xml.match(/<w:p>/g) || []).length).to.equal(1);
+	});
+
 	it("supports renderAsync", async () => {
 		const doc = createDoc(
 			paragraph(
@@ -241,6 +281,35 @@ describe("private conditional switch module", () => {
 			value: Promise.resolve("async value"),
 		});
 		expect(xmlText(renderedPart(doc))).to.equal("async value");
+	});
+
+	it("uses the same parser context for render and renderAsync", async () => {
+		const parser = expressionParser.configure({
+			postEvaluate(value, tag, scope, context) {
+				if (tag !== "name") {
+					return value;
+				}
+				const path = context.scopePathItem;
+				return `${path[path.length - 1]}:${value}`;
+			},
+		});
+		const template = paragraph(
+			"{#items}{!switch}{!case enabled}{name}{!default}off{/!switch};{/items}"
+		);
+		const data = {
+			items: [
+				{ name: "A", enabled: true },
+				{ name: "B", enabled: true },
+			],
+		};
+		const syncDoc = createDoc(template, { parser });
+		syncDoc.render(data);
+		const asyncDoc = createDoc(template, { parser });
+		await asyncDoc.renderAsync(data);
+		const syncText = xmlText(renderedPart(syncDoc));
+		const asyncText = xmlText(renderedPart(asyncDoc));
+		expect(syncText).to.equal("0:A;1:B;");
+		expect(asyncText).to.equal(syncText);
 	});
 
 	it("works in tables, headers, and footers", () => {
@@ -271,6 +340,30 @@ describe("private conditional switch module", () => {
 		expect(renderText(body, { enabled: true })).to.equal("selected");
 	});
 
+	it("rejects cross-container branches or renders well-formed XML", () => {
+		const body =
+			"<w:p><w:r><w:t>{!switch}{!case enabled}YES</w:t></w:r>" +
+			'<w:hyperlink w:anchor="target"><w:r><w:t>{!default}NO</w:t></w:r></w:hyperlink>' +
+			"<w:r><w:t>{/!switch}</w:t></w:r></w:p>";
+		let doc;
+		try {
+			doc = createDoc(body);
+			doc.render({ enabled: false });
+		} catch (error) {
+			expect(
+				getErrors(error).some(
+					(item) =>
+						item.properties.id ===
+						"conditional_switch_invalid_structure"
+				)
+			).to.equal(true);
+			return;
+		}
+		const xml = renderedPart(doc);
+		expect(xmlText(xml)).to.equal("NO");
+		expectWellFormedXml(xml);
+	});
+
 	it("preserves selected branch run formatting", () => {
 		const body =
 			"<w:p><w:r><w:t>{!switch}{!case enabled}</w:t></w:r>" +
@@ -281,6 +374,139 @@ describe("private conditional switch module", () => {
 		const xml = renderedPart(doc);
 		expect(xmlText(xml)).to.equal("Bold");
 		expect(xml).to.include("<w:b/>");
+	});
+
+	it("preserves the run formatting of a later default branch", () => {
+		const body =
+			"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>{!switch}{!case enabled}YES</w:t></w:r>" +
+			"<w:r><w:rPr><w:i/></w:rPr><w:t>{!default}NO{/!switch}</w:t></w:r></w:p>";
+		const doc = createDoc(body);
+		doc.render({ enabled: false });
+		const xml = renderedPart(doc);
+		const selectedRun = runContaining(xml, "NO");
+		expect(xmlText(xml)).to.equal("NO");
+		expect(selectedRun).to.be.a("string");
+		expect(selectedRun).to.include("<w:i/>");
+		expect(selectedRun).to.not.include("<w:b/>");
+	});
+
+	it("preserves a page break in a selected control paragraph", () => {
+		const body = [
+			paragraph("{!switch}"),
+			'<w:p><w:r><w:t>{!case enabled}</w:t></w:r><w:r><w:br w:type="page"/></w:r></w:p>',
+			paragraph("{!default}"),
+			paragraph("No break"),
+			paragraph("{/!switch}"),
+		].join("");
+		const doc = createDoc(body);
+		doc.render({ enabled: true });
+		const xml = renderedPart(doc);
+		expect(xml).to.include('<w:br w:type="page"/>');
+		expectWellFormedXml(xml);
+	});
+
+	it("preserves matching bookmark tags in a selected branch", () => {
+		const body = [
+			paragraph("{!switch}"),
+			'<w:p><w:r><w:t>{!case enabled}</w:t></w:r><w:bookmarkStart w:id="7" w:name="conditional"/></w:p>',
+			'<w:p><w:r><w:t>Bookmarked</w:t></w:r><w:bookmarkEnd w:id="7"/></w:p>',
+			paragraph("{!default}"),
+			paragraph("No bookmark"),
+			paragraph("{/!switch}"),
+		].join("");
+		const doc = createDoc(body);
+		doc.render({ enabled: true });
+		const xml = renderedPart(doc);
+		expect(xmlText(xml)).to.equal("Bookmarked");
+		expect(xml).to.include(
+			'<w:bookmarkStart w:id="7" w:name="conditional"/>'
+		);
+		expect(xml).to.include('<w:bookmarkEnd w:id="7"/>');
+		expectWellFormedXml(xml);
+	});
+
+	it("compiles each placeholder in branch content once", () => {
+		let compilations = 0;
+		function parser(tag, meta) {
+			if (tag === "value") {
+				compilations++;
+			}
+			return expressionParser(tag, meta);
+		}
+		createDoc(
+			paragraph(
+				"{!switch}{!case enabled}{value}{!default}fallback{/!switch}"
+			),
+			{ parser }
+		);
+		expect(compilations).to.equal(1);
+	});
+
+	it("reports an invalid branch placeholder only once", () => {
+		let thrown;
+		try {
+			createDoc(
+				paragraph(
+					"{!switch}{!case enabled}{customer.}{!default}fallback{/!switch}"
+				)
+			);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).to.not.equal(undefined);
+		const compilationErrors = getErrors(thrown).filter(
+			(error) =>
+				error.properties.id === "scopeparser_compilation_failed" &&
+				error.properties.xtag === "customer."
+		);
+		expect(compilationErrors).to.have.length(1);
+	});
+
+	it("keeps parser error attribution isolated between document parts", () => {
+		let thrown;
+		try {
+			createDoc(paragraph("123456789{broken.}"), {
+				parts: {
+					header: paragraph(
+						"{!switch}{!case headerCondition}H{/!switch}"
+					),
+				},
+			});
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).to.not.equal(undefined);
+		const bodyError = getErrors(thrown).find(
+			(error) => error.properties.file === "word/document.xml"
+		);
+		expect(bodyError).to.not.equal(undefined);
+		expect(bodyError.properties.id).to.equal(
+			"scopeparser_compilation_failed"
+		);
+		expect(bodyError.properties.xtag).to.equal("broken.");
+	});
+
+	it("accepts outer whitespace around case tags", () => {
+		expect(
+			renderText(
+				paragraph(
+					"{ !switch }{ !case enabled }YES{ !default }NO{ /!switch }"
+				),
+				{ enabled: true }
+			)
+		).to.equal("YES");
+	});
+
+	it("allows a case expression matching the former empty-case sentinel", () => {
+		const identifier = "__EMPTY_CONDITIONAL_SWITCH_CASE__";
+		expect(
+			renderText(
+				paragraph(
+					`{!switch}{!case ${identifier}}YES{!default}NO{/!switch}`
+				),
+				{ [identifier]: true }
+			)
+		).to.equal("YES");
 	});
 
 	it("keeps conditions and placeholders from every branch discoverable", () => {
